@@ -106,8 +106,8 @@ python train_and_register.py --strong   # run 3: promoted
 cd ../rag_auto_rca
 pip install scikit-learn
 python query_rca.py "pods crashing right after we rebuilt the base image, no error logs"
-# add ANTHROPIC_API_KEY to your environment first to use the real LLM path
-# instead of the template fallback
+# set ANTHROPIC_API_KEY and ANTHROPIC_MODEL in your environment first to
+# use the real LLM path instead of the template fallback
 
 cd ../monitoring
 python drift_exporter.py                # prints 6 simulated windows, PSI per feature,
@@ -197,8 +197,9 @@ KServe/Knative cluster — walk through it as a manifest.
   I stubbed that last network call rather than pretend it ran against
   infrastructure I don't have for this interview."
 - **RAG auto-RCA**: "Given a new alert, this retrieves the most similar
-  past incident and either has Claude synthesize an RCA grounded in that
-  postmortem, or falls back to pulling the Root Cause/Fix sections
+  past incident and either has an LLM (via the Anthropic API) synthesize
+  an RCA grounded in that postmortem, or falls back to pulling the Root
+  Cause/Fix sections
   directly if no API key is set. Two of the three incident docs are based
   on real production issues I've dealt with — a base image's inherited
   ENTRYPOINT silently swallowing a service's actual binary, and a JDK

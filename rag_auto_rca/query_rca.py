@@ -27,10 +27,10 @@ import urllib.request
 from ingest import build_index
 
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
-# Model id used when this was last tested. Anthropic model names change
-# over time — if this returns a 404/"model not found", swap in whatever
-# current Claude model id is available at anthropic.com/docs.
-ANTHROPIC_MODEL = "claude-sonnet-4-6"
+# Model id is read from the environment rather than hardcoded, since
+# Anthropic model names change over time — set ANTHROPIC_MODEL to whatever
+# current model id is listed at anthropic.com/docs before using this path.
+ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL")
 
 
 def extract_section(markdown_text: str, heading: str) -> str:
@@ -127,7 +127,9 @@ def query(alert_description: str) -> str:
     incident, score = top_matches[0]
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if api_key:
+    if api_key and not ANTHROPIC_MODEL:
+        print("[warn] ANTHROPIC_API_KEY is set but ANTHROPIC_MODEL is not; falling back to template mode.")
+    elif api_key:
         try:
             return llm_synthesized_rca(alert_description, incident, score, api_key)
         except Exception as exc:  # noqa: BLE001 - deliberately broad: any API failure should fall back, not crash the demo
