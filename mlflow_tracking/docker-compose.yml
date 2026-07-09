@@ -1,0 +1,34 @@
+# Optional MLflow tracking server + UI, for a visual walkthrough of the
+# Model Registry (experiments, versions, aliases) instead of reading
+# mlflow.db directly. NOT required to run train_and_register.py — that
+# script works standalone against the local sqlite:///mlflow.db file.
+#
+# Usage:
+#   docker compose up -d
+#   open http://localhost:5000
+#
+# Then point the training script at this server instead of the local file:
+#   MLFLOW_TRACKING_URI=http://localhost:5000 python train_and_register.py
+#
+# Known limitation: this uses a second, container-local SQLite file as the
+# backend store (mounted via the `mlflow-data` volume), not a real Postgres/
+# MySQL instance. Fine for a POC; a production MLflow server would use a
+# managed RDBMS for the backend store and S3/GCS/Azure Blob for artifacts,
+# both for durability and to support multiple concurrent writers.
+services:
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:latest
+    container_name: mlflow-server
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow-data:/mlflow
+    command: >
+      mlflow server
+      --backend-store-uri sqlite:///mlflow/mlflow.db
+      --default-artifact-root /mlflow/artifacts
+      --host 0.0.0.0
+      --port 5000
+
+volumes:
+  mlflow-data:
