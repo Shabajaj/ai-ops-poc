@@ -1,6 +1,21 @@
-# Pinned to the exact versions already verified working locally
-# (see the 3-run promotion-gate test in README.md), so the container
-# behaves identically to what's been tested, not "whatever's latest".
-mlflow==3.14.0
+# Deliberately mlflow-skinny + a hand-picked minimal set, not the full
+# "mlflow" package. The full package pulls in Flask/gunicorn/graphene
+# (for `mlflow server`'s UI, which this training container never runs)
+# plus matplotlib/pyarrow (artifact plotting/parquet, unused here) — all
+# of which this container was silently paying for in build-time memory
+# (Kaniko OOMKilled snapshotting a t3.small node until this was trimmed).
+#
+# This exact set was determined by actually running train_and_register.py
+# against it (not guessed): mlflow-skinny needs sqlalchemy+alembic for a
+# local sqlite tracking store, and mlflow.sklearn.log_model needs pandas
+# (schema inference) and skops (safe model serialization) even though
+# neither is obviously implied by "just log a model". All 3 promotion-gate
+# scenarios (auto-promote / reject / promote) were re-verified passing
+# against this exact set before it replaced the full "mlflow" package.
+mlflow-skinny==3.14.0
+sqlalchemy==2.0.51
+alembic==1.18.5
 scikit-learn==1.9.0
 numpy==2.5.1
+pandas==2.3.3
+skops==0.14.0
