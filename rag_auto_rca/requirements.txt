@@ -1,0 +1,6 @@
+# torch is a transitive dependency of sentence-transformers, pinned
+# explicitly since it's a large download and version drift here can
+# silently change embedding output slightly between runs.
+pinecone==9.1.0
+sentence-transformers==5.6.0
+torch==2.13.0

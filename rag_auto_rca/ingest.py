@@ -1,36 +1,60 @@
 """
-Builds a retrieval index over the sample incident postmortems.
+Pinecone-backed retrieval index over the incident postmortems — replaces
+the earlier TF-IDF + cosine-similarity approach with real sentence
+embeddings and a real vector database.
 
-SCOPE TRADE-OFF (be upfront about this in an interview): this uses TF-IDF +
-cosine similarity, not real embeddings. That's a deliberate same-day-POC
-decision, not a technical limitation I'm unaware of:
-  - TF-IDF needs zero external dependencies beyond scikit-learn, no API
-    calls, no vector DB, and is fully deterministic/offline — good for a
-    quick, explainable demo with only 3 documents
-  - A production version would use sentence embeddings (e.g. an embedding
-    model via the Anthropic/OpenAI API, or a local model like
-    sentence-transformers) stored in a real vector store (FAISS for
-    local/small-scale, or Pinecone/pgvector/OpenSearch for a managed,
-    scalable setup) — that gets you semantic similarity ("pods failing
-    silently after a base image change" matching an incident that never
-    uses those exact words), which TF-IDF's exact-token-overlap approach
-    cannot do
-  - At 3 documents, the gap between TF-IDF and embeddings is invisible; at
-    thousands of postmortems it would matter a lot. Flagging that gap here
-    is the point of the trade-off note.
+WHAT CHANGED FROM TF-IDF, AND WHY IT MATTERS: TF-IDF only measures literal
+word overlap between a query and each document — "pods keep dying with no
+logs" and "CrashLoopBackOff with no application output" score as barely
+related, because they share almost no words, even though they describe
+the same failure. An embedding model instead maps text to a vector (a
+list of numbers, here 384 of them) positioned so that texts with similar
+MEANING end up close together in that space, regardless of exact wording.
+Pinecone then does the actual "find the nearest vectors" search — for a
+3-document corpus a plain Python loop over embeddings would work exactly
+as well, but this is the real infrastructure you'd reach for once that
+corpus is thousands of postmortems and a linear scan stops being cheap.
 
-This script builds the index in-memory each run (no persistence) since the
-corpus is tiny and static for this POC. A real version would persist the
-index and support incremental updates as new postmortems are written.
+EMBEDDING MODEL: sentence-transformers/all-MiniLM-L6-v2 — runs locally, no
+API key or per-call cost, produces small 384-dimension vectors (cheap to
+store and search), and is a well-benchmarked default for semantic search.
+A production setup with more budget might use OpenAI's or Voyage's hosted
+embedding APIs for marginally higher quality; noted as an option, not a
+requirement — nothing about the retrieval or generation code downstream
+cares which embedding model produced the vectors.
 """
 
 import glob
 import os
 
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+from pinecone import Pinecone, ServerlessSpec
+from sentence_transformers import SentenceTransformer
 
 INCIDENTS_DIR = os.path.join(os.path.dirname(__file__), "sample_incidents")
+INDEX_NAME = "ai-ops-poc-incidents"
+EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
+EMBEDDING_DIMENSION = 384  # fixed by the model above — must match the Pinecone index's own dimension
+
+_model = None  # loaded lazily so importing this module doesn't pay the model-load cost every time
+
+
+def get_embedding_model() -> SentenceTransformer:
+    global _model
+    if _model is None:
+        _model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+    return _model
+
+
+def embed(texts: list[str]) -> list[list[float]]:
+    """
+    Turns a list of strings into a list of embedding vectors. Normalized
+    to unit length so that cosine similarity (what we configure the
+    Pinecone index to use) behaves the way you'd expect — with normalized
+    vectors, cosine similarity reduces to a simple dot product.
+    """
+    model = get_embedding_model()
+    vectors = model.encode(texts, normalize_embeddings=True)
+    return vectors.tolist()
 
 
 def load_incidents(incidents_dir: str = INCIDENTS_DIR) -> list[dict]:
@@ -43,38 +67,59 @@ def load_incidents(incidents_dir: str = INCIDENTS_DIR) -> list[dict]:
     return incidents
 
 
-class IncidentIndex:
+def get_pinecone_client() -> Pinecone:
+    api_key = os.environ.get("PINECONE_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "PINECONE_API_KEY is not set. Get a free API key at pinecone.io "
+            "and set it as an environment variable before running this."
+        )
+    return Pinecone(api_key=api_key)
+
+
+def ensure_index(pc: Pinecone):
+    """Creates the Pinecone index if it doesn't already exist, then returns a handle to it."""
+    if not pc.has_index(INDEX_NAME):
+        pc.create_index(
+            name=INDEX_NAME,
+            dimension=EMBEDDING_DIMENSION,
+            metric="cosine",
+            spec=ServerlessSpec(cloud="aws", region="us-east-1"),  # free-tier-eligible region
+        )
+    return pc.Index(INDEX_NAME)
+
+
+def build_index(incidents_dir: str = INCIDENTS_DIR):
     """
-    Thin wrapper around a TF-IDF vectorizer + cosine similarity search.
-    Kept intentionally simple — this is the whole "retrieval" step of the
-    RAG pipeline. `query_rca.py` swaps this class out for a real vector
-    store in the imagined "production" version without changing the
-    downstream synthesis step.
+    Embeds every incident doc and upserts them into Pinecone.
+
+    Pinecone metadata has a 40KB-per-vector size limit; our postmortems
+    are only a few KB each, so storing the full text as metadata directly
+    is fine — retrieval doesn't need a second lookup back to local files,
+    which matters once this runs somewhere that doesn't have the repo
+    checked out (e.g. a KServe/Lambda-style deployment).
     """
-
-    def __init__(self, incidents: list[dict]):
-        self.incidents = incidents
-        self.vectorizer = TfidfVectorizer(stop_words="english")
-        self.matrix = self.vectorizer.fit_transform([doc["text"] for doc in incidents])
-
-    def search(self, query: str, top_k: int = 1) -> list[tuple[dict, float]]:
-        """Returns the top_k most similar incidents as (incident, score) pairs."""
-        query_vec = self.vectorizer.transform([query])
-        scores = cosine_similarity(query_vec, self.matrix)[0]
-        ranked = sorted(zip(self.incidents, scores), key=lambda pair: pair[1], reverse=True)
-        return ranked[:top_k]
-
-
-def build_index(incidents_dir: str = INCIDENTS_DIR) -> IncidentIndex:
     incidents = load_incidents(incidents_dir)
     if not incidents:
         raise RuntimeError(f"No incident .md files found in {incidents_dir}")
-    return IncidentIndex(incidents)
+
+    pc = get_pinecone_client()
+    index = ensure_index(pc)
+
+    vectors = embed([doc["text"] for doc in incidents])
+    upsert_payload = [
+        {
+            "id": doc["filename"],
+            "values": vector,
+            "metadata": {"filename": doc["filename"], "text": doc["text"]},
+        }
+        for doc, vector in zip(incidents, vectors)
+    ]
+    index.upsert(vectors=upsert_payload)
+    return index
 
 
 if __name__ == "__main__":
-    # Quick manual sanity check: build the index and show what it contains.
-    index = build_index()
-    print(f"Indexed {len(index.incidents)} incidents:")
-    for doc in index.incidents:
-        print(f"  - {doc['filename']}")
+    idx = build_index()
+    print(f"Upserted incidents into Pinecone index '{INDEX_NAME}'.")
+    print(f"Index stats: {idx.describe_index_stats()}")

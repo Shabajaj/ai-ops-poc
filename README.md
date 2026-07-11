@@ -64,6 +64,14 @@
   confirmed completing with the same promotion-gate output as the local
   runs. See `mlflow_tracking/Dockerfile`, `kaniko-build-job.yaml`, and
   `k8s-job.yaml`.
+- **`rag_auto_rca/`** — retrieval upgraded from TF-IDF to real sentence
+  embeddings (`sentence-transformers/all-MiniLM-L6-v2`, local, no API key)
+  stored and queried in a real Pinecone index. Verified end-to-end against
+  live Pinecone with all 3 sample incidents retrieving correctly, real
+  cosine-similarity scores in the 0.62-0.75 range for correct matches vs.
+  0.07-0.44 for non-matches — a clearer separation than TF-IDF's closer
+  0.33-0.45 range on the same 3 queries. Generation step (Anthropic API
+  call / template fallback) unchanged — only retrieval was swapped.
 - Everything else in this repo is still at the status described inline in
   each component's own comments (some fully tested locally, some
   designed-but-not-deployed) — not yet re-verified against a live cluster.

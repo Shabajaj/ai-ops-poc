@@ -12,10 +12,13 @@ Two synthesis modes:
      generated analysis. This mode has no external dependency and is what's
      been tested end-to-end for this POC.
 
-SCOPE NOTE: matching "most similar past incident" is doing a lot of work
-here for a 3-document corpus — see ingest.py for the TF-IDF-vs-embeddings
-trade-off. The synthesis step (this file) is independent of that choice;
-swapping in a real vector store would not require changing this file.
+RETRIEVAL: now backed by Pinecone + sentence-transformer embeddings
+(see ingest.py) instead of TF-IDF. This file's synthesis step (the LLM
+call / template fallback below) didn't need to change at all when that
+swap happened — it only cares about "here's the retrieved incident text
+and a similarity score," not how retrieval produced them. That's the
+intended benefit of separating retrieval from generation in a RAG
+pipeline: you can upgrade one without touching the other.
 """
 
 import argparse
@@ -24,7 +27,7 @@ import os
 import re
 import urllib.request
 
-from ingest import build_index
+from ingest import INDEX_NAME, embed, get_pinecone_client
 
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 # Model id is read from the environment rather than hardcoded, since
@@ -121,10 +124,29 @@ available."""
     return "[LLM-SYNTHESIZED — via Anthropic API]\n\n" + "\n".join(text_parts)
 
 
+def retrieve_top_match(alert_description: str) -> tuple[dict, float]:
+    """
+    Embeds the incoming alert text with the same model used to embed the
+    incident postmortems (embeddings from different models aren't
+    comparable — this MUST match ingest.py's model), then asks Pinecone
+    for the single nearest stored vector by cosine similarity.
+    """
+    pc = get_pinecone_client()
+    index = pc.Index(INDEX_NAME)
+
+    query_vector = embed([alert_description])[0]
+    response = index.query(vector=query_vector, top_k=1, include_metadata=True)
+
+    if not response.matches:
+        raise RuntimeError("Pinecone index is empty — run ingest.py first.")
+
+    match = response.matches[0]
+    incident = {"filename": match.metadata["filename"], "text": match.metadata["text"]}
+    return incident, match.score
+
+
 def query(alert_description: str) -> str:
-    index = build_index()
-    top_matches = index.search(alert_description, top_k=1)
-    incident, score = top_matches[0]
+    incident, score = retrieve_top_match(alert_description)
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if api_key and not ANTHROPIC_MODEL:
