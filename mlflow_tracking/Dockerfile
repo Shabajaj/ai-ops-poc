@@ -13,7 +13,7 @@
 # what that server looks like) so multiple Job runs share one registry.
 # This image supports that via the MLFLOW_TRACKING_URI env var — it's
 # just not pointed at one by default, since none is deployed yet.
-FROM python:3.11-slim
+FROM python:3.12-slim
 
 WORKDIR /app
 

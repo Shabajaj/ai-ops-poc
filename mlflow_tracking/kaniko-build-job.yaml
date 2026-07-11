@@ -1,0 +1,53 @@
+# One-off image build, run INSIDE the cluster instead of on a local
+# machine — this exists because this POC was built on a Windows machine
+# without Docker Desktop installed (would have needed an admin-elevated
+# WSL2 install + restart) and AWS CloudShell was blocked by pending
+# account verification. Kaniko is a real, standard tool for exactly this
+# situation: it builds a Dockerfile into an image and pushes it to a
+# registry using only a plain container, no Docker daemon required at all
+# — which matters in any environment where you can't/don't want to grant
+# a build job access to the host's Docker socket (this cluster included).
+#
+# Security note: the ServiceAccount below is bound (via IRSA — IAM Roles
+# for Service Accounts) to an IAM role that can ONLY push to the single
+# pod-crashloop-classifier-trainer ECR repo — see
+# kaniko-ecr-push-pod-crashloop-classifier-trainer in IAM. Nothing broader
+# than "push to this one repo" was granted.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kaniko-builder
+  namespace: mlops-poc
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::826496717812:role/kaniko-builder-mlops-poc
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: build-pod-crashloop-classifier-trainer
+  namespace: mlops-poc
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      serviceAccountName: kaniko-builder
+      restartPolicy: Never
+      containers:
+        - name: kaniko
+          image: gcr.io/kaniko-project/executor:v1.23.2
+          args:
+            # Builds straight from the GitHub repo — no local source copy
+            # needed. #main pins the branch; context-sub-path scopes the
+            # build to just the mlflow_tracking/ folder within the repo.
+            - "--context=git://github.com/Shabajaj/ai-ops-poc.git#refs/heads/master"
+            - "--context-sub-path=mlflow_tracking"
+            - "--dockerfile=Dockerfile"
+            - "--destination=826496717812.dkr.ecr.us-east-1.amazonaws.com/pod-crashloop-classifier-trainer:latest"
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
