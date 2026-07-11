@@ -53,4 +53,17 @@
                                  └──────── triggers a new Kubeflow run ────┐
                                                                             │
                                           (loop closes back to the top) ◀──┘
-``
+```
+
+## Live deployment status
+
+- **`mlflow_tracking/train_and_register.py`** — beyond local testing, this
+  now also runs as a real Kubernetes `Job` on a live EKS cluster
+  (`gpu-poc-cluster`, reused from `eks-gpu-poc`). Built via Kaniko running
+  in-cluster (no local Docker/CloudShell available), pushed to ECR, and
+  confirmed completing with the same promotion-gate output as the local
+  runs. See `mlflow_tracking/Dockerfile`, `kaniko-build-job.yaml`, and
+  `k8s-job.yaml`.
+- Everything else in this repo is still at the status described inline in
+  each component's own comments (some fully tested locally, some
+  designed-but-not-deployed) — not yet re-verified against a live cluster.
