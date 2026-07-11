@@ -23,6 +23,7 @@ Run this multiple times to see the promotion gate in action:
 """
 
 import argparse
+import os
 import sys
 
 import mlflow
@@ -42,7 +43,12 @@ PRODUCTION_ALIAS = "production"
 # on current MLflow versions. sqlite:// is the simplest DB-backed option
 # for a single-machine POC; a real deployment would point this at a
 # managed Postgres instance (see docker-compose.yml for that variant).
-TRACKING_URI = "sqlite:///mlflow.db"
+#
+# Overridable via MLFLOW_TRACKING_URI so the same container image can run
+# standalone (local sqlite file) or in a cluster pointed at a shared,
+# persistent MLflow server — see Dockerfile for why that distinction
+# matters when this runs as a Kubernetes Job.
+TRACKING_URI = os.environ.get("MLFLOW_TRACKING_URI", "sqlite:///mlflow.db")
 
 
 def make_synthetic_dataset(n_samples: int, noise: float, seed: int):

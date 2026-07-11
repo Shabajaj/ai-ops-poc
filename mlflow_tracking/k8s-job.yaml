@@ -1,0 +1,41 @@
+# Kubernetes Job (not a Deployment) that runs train_and_register.py once
+# and exits — a Job is the right primitive here because training has a
+# natural end (success or failure), unlike a Deployment which is built to
+# keep N replicas running forever and would just restart the training
+# script in a loop, which is not what we want.
+#
+# KNOWN LIMITATION: no MLFLOW_TRACKING_URI env var is set below, so this
+# Job uses the image's default (a sqlite file inside the container). That
+# means: (a) each time you re-run this Job, it starts from a blank
+# registry — there's no persistence across runs — and (b) once the pod is
+# deleted, the registry data is gone. This is fine for proving "the
+# training + promotion-gate code runs correctly inside a real pod on a
+# real cluster," which is the goal here, but it is NOT the same as a
+# shared, durable Model Registry multiple Jobs write into over time. That
+# would need either a mounted PersistentVolumeClaim or (better) pointing
+# MLFLOW_TRACKING_URI at a separately-deployed MLflow server — out of
+# scope for this first run, noted here rather than silently glossed over.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pod-crashloop-classifier-training
+  namespace: mlops-poc
+spec:
+  backoffLimit: 1 # don't endlessly retry a training script that fails deterministically
+  ttlSecondsAfterFinished: 3600 # auto-clean the pod an hour after it finishes, so it doesn't linger
+  template:
+    spec:
+      restartPolicy: Never # Jobs require Never or OnFailure, not Always (that's a Deployment thing)
+      containers:
+        - name: trainer
+          image: 826496717812.dkr.ecr.us-east-1.amazonaws.com/pod-crashloop-classifier-trainer:latest
+          # No args = default run (F1≈0.62, auto-promotes since registry is
+          # blank in-container). Change to ["--weak"] or ["--strong"] to
+          # demo the other two promotion-gate paths in separate Job runs.
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"

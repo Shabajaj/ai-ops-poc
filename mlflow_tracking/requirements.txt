@@ -1,0 +1,6 @@
+# Pinned to the exact versions already verified working locally
+# (see the 3-run promotion-gate test in README.md), so the container
+# behaves identically to what's been tested, not "whatever's latest".
+mlflow==3.14.0
+scikit-learn==1.9.0
+numpy==2.5.1
