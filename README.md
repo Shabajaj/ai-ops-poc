@@ -87,11 +87,23 @@
   canary mechanism actually works in this version — both documented
   in-line in `inferenceservice.yaml` with what the fix was and how it was
   confirmed.
+- **`kubeflow/`** — `training_pipeline.py` still compiles cleanly to
+  `training_pipeline.yaml` (KFP's own IR format), but that file needs the
+  full Kubeflow Pipelines backend (API server + MySQL + MinIO, plus an
+  EBS CSI driver this cluster doesn't have) to actually run — a bigger
+  lift than this timeline could absorb after Items 1 and 3's infra
+  debugging. Instead, `training_pipeline_argo_workflow.yaml` is a
+  hand-written native Argo Workflow mirroring the same DAG shape, run
+  live on a real Argo Workflows install on the same cluster: all 4 steps
+  completed, `evaluate-model` independently scored F1=0.5954, and the
+  conditional `register-and-promote` step correctly triggered and
+  promoted a version. `argo-executor-rbac.yaml` documents two real RBAC
+  gaps in Argo's base install found by submitting and watching it fail.
 - Everything else in this repo is still at the status described inline in
   each component's own comments (some fully tested locally, some
   designed-but-not-deployed) — not yet re-verified against a live cluster.
 
-## Infrastructure notes learned from deploying Items 1 and 3 live
+## Infrastructure notes learned from deploying Items 1, 3, and 4 live
 
 Both of these came from actually running things on a real cluster, not
 from reading docs beforehand — worth knowing if this comes up in an
@@ -124,3 +136,14 @@ interview as "what surprised you":
   show no changes, and assume it "just doesn't apply" rather than that
   the setting is a no-op. `block_device_mappings` is the form that
   actually takes effect.
+- **`kubectl apply` has a hidden 256KB ceiling** via the
+  `last-applied-configuration` annotation it writes — Argo Workflows'
+  CRDs (large embedded OpenAPI schemas) exceed it outright. Fixed with
+  `kubectl apply --server-side`, which doesn't store that annotation.
+- **A tool's base install manifest isn't always self-sufficient RBAC.**
+  Argo Workflows' `install.yaml` grants its controller everything it
+  needs, but not what individual workflow step pods need to report their
+  own results back (`workflowtaskresults` create/patch) or to offload
+  large parameters to a ConfigMap — both had to be granted separately,
+  found by submitting a real workflow and reading the exact permission
+  error twice, not by anticipating it from the docs.
