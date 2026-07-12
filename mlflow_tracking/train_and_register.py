@@ -122,6 +122,15 @@ def train_and_log(noise: float, seed: int) -> tuple[str, float]:
             model,
             name="model",
             input_example=X_test[:1],
+            # mlflow 3.x defaults sklearn models to "skops" serialization
+            # (safer than raw pickle) — but KServe's bundled mlserver image
+            # ships an older mlflow that only understands pickle/cloudpickle
+            # and fails to load a skops-serialized model at serve time
+            # (discovered by actually deploying this to a live KServe
+            # InferenceService, not by reading docs). cloudpickle keeps
+            # compatibility with that runtime without giving up on a
+            # (mostly) safer format than raw pickle.
+            serialization_format="cloudpickle",
         )
 
         print(f"Run {run.info.run_id}: F1 = {f1:.4f} (params={params})")

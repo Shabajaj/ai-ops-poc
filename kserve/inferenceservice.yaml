@@ -2,11 +2,14 @@
 # registered in MLflow (see ../mlflow_tracking/train_and_register.py) as a
 # REST endpoint on Kubernetes.
 #
-# STATUS: written for conceptual walkthrough, NOT deployed against a live
-# cluster. I don't have a running KServe/Knative install for this interview
-# timeline. Everything below is a real, valid KServe v1beta1 manifest —
-# what's "demo-scoped" is that I haven't run `kubectl apply` against it, not
-# that the YAML itself is fake or simplified.
+# STATUS: DEPLOYED AND VERIFIED LIVE against a real EKS cluster
+# (gpu-poc-cluster, reused from eks-gpu-poc) with a real KServe + Knative +
+# Istio install. Verified: pod running 2/2, a real V2-protocol inference
+# request returning correct predictions for both a high-risk and a
+# low-risk input, and a real canary rollout (90/10, then shifted to
+# 50/50) with both revisions serving traffic simultaneously. See
+# README.md's live deployment status section for the full account,
+# including two real bugs hit and fixed along the way (see below).
 #
 # --- How MLflow's Model Registry connects to this manifest ---
 # KServe's predictor reads model artifacts from object storage (S3/GCS/Azure
@@ -14,36 +17,48 @@
 # directly. So the real pipeline is:
 #   1. train_and_register.py registers a version and (if it passes the
 #      promotion gate) moves the "production" alias to it in MLflow
-#   2. A sync step (not built in this POC — would be a small script or CI
-#      job) copies that model version's artifacts from MLflow's artifact
-#      store to the S3 path referenced below by storageUri
+#   2. A sync step copies that model version's artifacts from MLflow's
+#      artifact store to the S3 path referenced below by storageUri — done
+#      manually here via `aws s3 cp` (see README), not automated into a CI
+#      job, since that's a separate piece of plumbing from KServe itself
 #   3. This InferenceService's storageUri is updated to point at the new
 #      path, which is what actually triggers KServe to roll out a new
 #      revision
 # This gap (registry alias -> object storage sync) is a real production
 # consideration worth naming explicitly if asked "how does this connect
 # end-to-end" — it's not automatic just because both tools are Kubernetes shows.
+#
+# --- Real bug #1: serialization format mismatch ---
+# mlflow 3.x defaults sklearn model logging to "skops" serialization (safer
+# than raw pickle), but KServe's bundled mlserver:1.5.0 image ships an
+# older mlflow that only understands pickle/cloudpickle and fails to load
+# a skops-serialized model at serve time. Fixed by passing
+# serialization_format="cloudpickle" explicitly in train_and_register.py's
+# mlflow.sklearn.log_model() call — a real training/serving version-skew
+# issue, not something obvious from either tool's docs in isolation.
 apiVersion: serving.kserve.io/v1beta1
 kind: InferenceService
 metadata:
   name: pod-crashloop-classifier
   namespace: mlops-poc
-  annotations:
-    # --- Canary rollout knob (see "Canary rollout" section below) ---
-    # KServe canary rollout works differently from a typical Argo Rollouts/
-    # Istio VirtualService split: it's a single InferenceService object.
-    # When you update spec.predictor (e.g. a new storageUri for a new model
-    # version), KServe creates a new Knative Revision for it but does NOT
-    # cut traffic over immediately. This annotation controls what percentage
-    # of traffic the NEW revision gets; the remainder stays on the last
-    # revision that had 100% traffic (the de facto "stable" version).
-    #
-    # Set to 0 here = fully on the current model, no canary in flight.
-    # See the "canary rollout, step by step" comment block below for how
-    # this value changes during an actual rollout.
-    serving.kserve.io/canaryTrafficPercent: "0"
 spec:
   predictor:
+    # --- Real bug #2: canary rollout mechanism ---
+    # This was originally written (before ever deploying) as a
+    # `serving.kserve.io/canaryTrafficPercent` ANNOTATION, based on older
+    # KServe docs/examples. That's wrong for this version (v0.19.0): the
+    # controller logs showed `CanaryTrafficPercent: null` even with the
+    # annotation set, and a change applied as a separate follow-up
+    # `kubectl annotate` (after the storageUri patch) got reconciled to
+    # 100% before the annotation was even read. The actual, current
+    # mechanism — confirmed by reading pkg/apis/serving/v1beta1/component.go
+    # and pkg/controller/.../ksvc_reconciler.go in the KServe source — is a
+    # real SPEC FIELD on predictor, canaryTrafficPercent, applied in the
+    # SAME kubectl apply/patch as the storageUri change. Verified working:
+    # a real 90/10 split (two revisions serving simultaneously), then
+    # shifted live to 50/50 by patching just this one field.
+    canaryTrafficPercent: 50
+
     # minReplicas: 1 keeps this warm instead of scaling to zero — trades a
     # small always-on cost for avoiding cold-start latency on the first
     # request after idle. KServe/Knative default to scale-to-zero, which is
@@ -54,18 +69,24 @@ spec:
     maxReplicas: 3
 
     model:
-      # KServe's built-in MLflow model server understands the MLmodel
-      # artifact format directly (conda env + model.pkl + MLmodel file) —
-      # no custom container needed for a plain scikit-learn model like this.
+      # KServe's built-in MLflow model server (via the kserve-mlserver
+      # ClusterServingRuntime, confirmed by checking its
+      # supportedModelFormats on the live cluster) understands the MLmodel
+      # artifact format directly — no custom container needed for a plain
+      # scikit-learn model like this.
       modelFormat:
         name: mlflow
       protocolVersion: v2
 
-      # Points at the model artifacts for the CURRENT production version
-      # (see the artifact-sync note above — this is not a live MLflow
-      # registry URI, it's wherever the synced artifacts live in object
-      # storage). Version number in the path is illustrative.
-      storageUri: "s3://mlops-poc-models/pod-crashloop-classifier/v3/"
+      # Points at the model artifacts for the CURRENT stable version — a
+      # real S3 bucket, populated via `aws s3 cp` from the local MLflow
+      # artifact store. v4 here is the currently-stable revision from the
+      # canary walkthrough (see README for the full version history:
+      # v3 = original production model, F1=0.8442; v4 = the default/
+      # unpromoted run, F1=0.6211, reused as a second artifact purely to
+      # exercise the canary mechanism against a real second model rather
+      # than because it's actually a better candidate).
+      storageUri: "s3://ai-ops-poc-models-826496717812/pod-crashloop-classifier/v4/"
 
       resources:
         requests:
@@ -75,58 +96,55 @@ spec:
           cpu: "1"
           memory: "1Gi"
 
-    # Credentials for the storageUri above. In a real cluster this
-    # ServiceAccount would be annotated/bound to IRSA (IAM Roles for
-    # Service Accounts) rather than embedding static credentials — omitted
-    # here since there's no real bucket behind this POC.
-    serviceAccountName: kserve-model-reader
+    # Credentials for the storageUri above: a real ServiceAccount bound via
+    # IRSA (IAM Roles for Service Accounts) to a role
+    # (kserve-predictor-s3-read) scoped to read-only access on exactly the
+    # pod-crashloop-classifier/ prefix in this one bucket — not broad S3
+    # access, and not the same role used by the Kaniko build job in Item 1.
+    serviceAccountName: kserve-predictor-sa
 
-# --- Canary rollout, step by step (for interview walkthrough) ---
-# (Not a second resource — no `---` document separator above, since the
-# canary flow below mutates the single InferenceService already defined,
-# it doesn't create a new one. Keeping it comment-only avoids `kubectl
-# apply -f` choking on a stray empty YAML document.)
+# --- Canary rollout, step by step (as actually run, not just described) ---
 #
-# This is intentionally shown as a sequence of comments rather than a
-# second live resource, since KServe canary rollout mutates the SAME
-# InferenceService object above rather than creating a second one — there
-# is no separate "canary InferenceService" resource in this API, unlike a
-# typical two-Deployment blue/green setup.
+# Step 1 — ship a new model version and canary annotation TOGETHER in one
+# apply (this is the part that must be atomic — see "Real bug #2" above):
+#   kubectl apply -f - <<EOF
+#   apiVersion: serving.kserve.io/v1beta1
+#   kind: InferenceService
+#   metadata:
+#     name: pod-crashloop-classifier
+#     namespace: mlops-poc
+#   spec:
+#     predictor:
+#       canaryTrafficPercent: 10
+#       model:
+#         storageUri: "s3://ai-ops-poc-models-826496717812/pod-crashloop-classifier/v3/"
+#       ... (other fields as above)
+#   EOF
 #
-# Step 1 — ship a new model version, start it at a small traffic slice:
-#   kubectl patch isvc pod-crashloop-classifier -n mlops-poc --type merge -p '
-#     spec:
-#       predictor:
-#         model:
-#           storageUri: "s3://mlops-poc-models/pod-crashloop-classifier/v4/"
-#   '
-#   kubectl annotate isvc pod-crashloop-classifier -n mlops-poc \
-#     serving.kserve.io/canaryTrafficPercent=10 --overwrite
-#
-#   -> KServe creates a new Knative Revision for v4 and routes 10% of
-#      traffic to it; 90% keeps going to the v3 revision already running.
-#      Both revisions are live simultaneously — this is what makes it a
-#      true canary rather than a hard cutover.
+#   -> KServe creates a new Knative Revision and routes 10% of traffic to
+#      it; 90% keeps going to the previous revision, tagged "prev" in
+#      `kubectl get ksvc <name>-predictor -o jsonpath='{.status.traffic}'`.
+#      Both revisions are live simultaneously with real running pods —
+#      confirmed via `kubectl get pods -n mlops-poc` showing two 2/2
+#      Running pods, one per revision.
 #
 # Step 2 — watch error rate / latency / (in this POC's world) drift_exporter
 # output for the canary revision specifically. KServe/Knative expose
-# per-revision metrics, so this can be scoped to just the v4 traffic slice
-# rather than the blended total.
+# per-revision metrics, so this can be scoped to just the canary's traffic
+# slice rather than the blended total.
 #
-# Step 3a — looks good, increase the slice progressively:
-#   kubectl annotate isvc pod-crashloop-classifier -n mlops-poc \
-#     serving.kserve.io/canaryTrafficPercent=50 --overwrite
-#   # ... then eventually:
-#   kubectl annotate isvc pod-crashloop-classifier -n mlops-poc \
-#     serving.kserve.io/canaryTrafficPercent=100 --overwrite
-#   # at 100%, v4 is now the de facto stable revision; the next model
-#   # version would canary against v4 in turn.
+# Step 3a — looks good, shift the split by patching just this one field
+# (verified live: this alone triggers the reconciler to rebalance traffic,
+# no need to reapply storageUri):
+#   kubectl patch inferenceservice pod-crashloop-classifier -n mlops-poc \
+#     --type merge -p '{"spec":{"predictor":{"canaryTrafficPercent":50}}}'
+#   # ... then eventually, to fully promote:
+#   kubectl patch inferenceservice pod-crashloop-classifier -n mlops-poc \
+#     --type merge -p '{"spec":{"predictor":{"canaryTrafficPercent":100}}}'
 #
-# Step 3b — looks bad, roll back instantly by pinning traffic back to 0
-# for the canary (no need to re-apply the old storageUri — the v3 revision
-# is still live in the background until traffic is fully drained from it):
-#   kubectl annotate isvc pod-crashloop-classifier -n mlops-poc \
-#     serving.kserve.io/canaryTrafficPercent=0 --overwrite
+# Step 3b — looks bad, roll back instantly by pinning the percent back to 0:
+#   kubectl patch inferenceservice pod-crashloop-classifier -n mlops-poc \
+#     --type merge -p '{"spec":{"predictor":{"canaryTrafficPercent":0}}}'
 #
 # This is conceptually the same pattern as the AKS canary work referenced
 # in my background — a small live-traffic slice, a rollback path that
