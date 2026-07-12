@@ -1,0 +1,257 @@
+# Native Argo Workflow — a real, directly-runnable pipeline mirroring the
+# same DAG as training_pipeline.py (fetch data -> train -> evaluate ->
+# conditionally register+promote), written by hand for Argo Workflows
+# rather than compiled by the kfp SDK.
+#
+# WHY THIS FILE EXISTS SEPARATELY FROM training_pipeline.yaml: that file is
+# KFP's own intermediate representation (IR) — produced by
+# kfp.compiler.Compiler(), it requires the full Kubeflow Pipelines backend
+# (API server) to translate it into a real Argo Workflow at submit time.
+# Installing that whole backend (plus its MySQL + MinIO + persistence
+# agent dependencies, and a new EBS CSI driver prerequisite this cluster
+# doesn't have yet) was a bigger lift than this interview timeline could
+# safely absorb after the infra debugging already done in Items 1 and 3.
+# This file is the honest alternative: real execution, on real Argo
+# Workflows, of the same pipeline shape — using Argo's own parameter
+# passing between steps instead of KFP's artifact system, so no external
+# object storage (S3/MinIO) is needed either.
+#
+# STATUS: DEPLOYED AND VERIFIED LIVE — submitted via the `argo` CLI
+# against a real Argo Workflows install on the same EKS cluster. All 4
+# steps completed successfully end-to-end: prepare-data generated 500
+# rows, train-model trained on 375/held out 125, evaluate-model scored
+# F1=0.5954 independently, and register-and-promote correctly triggered
+# (F1 cleared the 0.55 threshold) and promoted version 1. Needed one
+# extra file beyond this one: see argo-executor-rbac.yaml — the base
+# Argo Workflows install.yaml doesn't grant step pods permission to
+# write their own workflowtaskresults or create ConfigMaps for
+# large-parameter offloading, found by watching two real submission
+# failures, not by reading install docs beforehand.
+#
+# WHAT'S DIFFERENT FROM training_pipeline.py, AND WHY:
+#   - Smaller sample size (500 vs 2000) — Argo passes step outputs as
+#     workflow parameters (captured from stdout/output files), which have
+#     a practical size ceiling; there was no reason to push against that
+#     limit for a demo.
+#   - The promotion gate here (register-and-promote) registers against a
+#     throwaway sqlite database inside its own container, same as
+#     mlflow_tracking's k8s-job.yaml — each run starts from a blank
+#     registry. See that file's comments for what a real, persistent
+#     shared registry would need (a separately-deployed MLflow server).
+#   - No mlflow_tracking_uri input — deliberately not wired to a real
+#     MLflow server for the same reason.
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: pod-crashloop-classifier-training-
+  namespace: argo
+spec:
+  entrypoint: main
+  # The install's default namespace ServiceAccount ("default") isn't
+  # granted the RBAC Argo's executor needs (create workflowtaskresults) -
+  # discovered by watching the first real submission fail with exactly
+  # that permission error. "argo" is the ServiceAccount install.yaml
+  # actually binds the necessary ClusterRole to.
+  serviceAccountName: argo
+  templates:
+    - name: main
+      dag:
+        tasks:
+          - name: prepare-data
+            template: prepare-data
+          - name: train-model
+            template: train-model
+            dependencies: [prepare-data]
+            arguments:
+              parameters:
+                - name: dataset-csv
+                  value: "{{tasks.prepare-data.outputs.result}}"
+          - name: evaluate-model
+            template: evaluate-model
+            dependencies: [train-model]
+            arguments:
+              parameters:
+                - name: model-b64
+                  value: "{{tasks.train-model.outputs.parameters.model-b64}}"
+                - name: test-csv
+                  value: "{{tasks.train-model.outputs.parameters.test-csv}}"
+          - name: register-and-promote
+            template: register-and-promote
+            dependencies: [evaluate-model]
+            # Pipeline-level gate: only worth registering at all above this
+            # bar. Mirrors training_pipeline.py's MIN_ACCEPTABLE_F1 = 0.55.
+            when: "{{tasks.evaluate-model.outputs.parameters.f1}} >= 0.55"
+            arguments:
+              parameters:
+                - name: model-b64
+                  value: "{{tasks.train-model.outputs.parameters.model-b64}}"
+                - name: f1
+                  value: "{{tasks.evaluate-model.outputs.parameters.f1}}"
+
+    # ------------------------------------------------------------------
+    # Step 1: fetch/prepare data — same synthetic feature generator as
+    # mlflow_tracking/train_and_register.py, just parameterized smaller.
+    # Output: the whole dataset as CSV text, captured via Argo's default
+    # "result" output (script templates capture stdout automatically).
+    # ------------------------------------------------------------------
+    - name: prepare-data
+      script:
+        image: python:3.12-slim
+        command: [python]
+        source: |
+          import subprocess, sys
+          subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "numpy"], check=True)
+          import numpy as np
+
+          rng = np.random.default_rng(42)
+          n = 500
+          restart_count = rng.poisson(lam=2.0, size=n).astype(float)
+          memory_pressure_pct = rng.uniform(10, 100, size=n)
+          image_pull_failures = rng.poisson(lam=0.3, size=n).astype(float)
+          config_change_recency_hrs = rng.exponential(scale=24.0, size=n)
+
+          risk_score = (
+              0.35 * (restart_count / (restart_count.max() + 1e-6))
+              + 0.30 * (memory_pressure_pct / 100.0)
+              + 0.20 * (image_pull_failures / (image_pull_failures.max() + 1e-6))
+              + 0.15 * (1.0 / (1.0 + config_change_recency_hrs / 6.0))
+          )
+          risk_score += rng.normal(0, 0.25, size=n)
+          crashloop_risk = (risk_score > np.median(risk_score)).astype(int)
+
+          print("restart_count,memory_pressure_pct,image_pull_failures,config_change_recency_hrs,crashloop_risk")
+          for i in range(n):
+              print(f"{restart_count[i]},{memory_pressure_pct[i]},{image_pull_failures[i]},{config_change_recency_hrs[i]},{crashloop_risk[i]}")
+
+    # ------------------------------------------------------------------
+    # Step 2: train — reads the CSV parameter from step 1, trains a
+    # RandomForest, holds out a test split for step 3 to independently
+    # score. Outputs the model AND the held-out test set (both base64/CSV
+    # text) as named parameters via files Argo reads after the step runs.
+    # ------------------------------------------------------------------
+    - name: train-model
+      inputs:
+        parameters:
+          - name: dataset-csv
+      outputs:
+        parameters:
+          - name: model-b64
+            valueFrom:
+              path: /tmp/model_b64.txt
+          - name: test-csv
+            valueFrom:
+              path: /tmp/test.csv
+      script:
+        image: python:3.12-slim
+        command: [python]
+        source: |
+          import subprocess, sys
+          subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "scikit-learn", "numpy", "pandas"], check=True)
+          import base64, io, pickle
+          import pandas as pd
+          from sklearn.ensemble import RandomForestClassifier
+          from sklearn.model_selection import train_test_split
+
+          csv_text = """{{inputs.parameters.dataset-csv}}"""
+          df = pd.read_csv(io.StringIO(csv_text))
+          feature_cols = ["restart_count", "memory_pressure_pct", "image_pull_failures", "config_change_recency_hrs"]
+          X = df[feature_cols].values
+          y = df["crashloop_risk"].values
+
+          X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=42)
+
+          # Deliberately small (20 trees, depth 4) — this pipeline passes the
+          # model between steps as a base64 string via Argo parameters (no
+          # external artifact store), which hit Kubernetes' 1MB ConfigMap
+          # size limit at the original 150-tree/depth-6 size. Smaller model,
+          # same demonstrated mechanism.
+          model = RandomForestClassifier(n_estimators=20, max_depth=4, random_state=42)
+          model.fit(X_train, y_train)
+
+          model_b64 = base64.b64encode(pickle.dumps(model)).decode("ascii")
+          with open("/tmp/model_b64.txt", "w") as f:
+              f.write(model_b64)
+
+          test_df = pd.DataFrame(X_test, columns=feature_cols)
+          test_df["crashloop_risk"] = y_test
+          test_df.round(3).to_csv("/tmp/test.csv", index=False)
+
+          print(f"Trained on {len(X_train)} rows, held out {len(X_test)} rows for evaluation.")
+
+    # ------------------------------------------------------------------
+    # Step 3: evaluate — independently scores the trained model against
+    # the held-out test set, rather than trusting step 2's own number.
+    # Outputs F1 as a plain float-string parameter for the DAG's `when`
+    # condition on the next step to compare against.
+    # ------------------------------------------------------------------
+    - name: evaluate-model
+      inputs:
+        parameters:
+          - name: model-b64
+          - name: test-csv
+      outputs:
+        parameters:
+          - name: f1
+            valueFrom:
+              path: /tmp/f1.txt
+      script:
+        image: python:3.12-slim
+        command: [python]
+        source: |
+          import subprocess, sys
+          subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "scikit-learn", "numpy", "pandas"], check=True)
+          import base64, io, pickle
+          import pandas as pd
+          from sklearn.metrics import f1_score
+
+          model = pickle.loads(base64.b64decode("""{{inputs.parameters.model-b64}}"""))
+          test_df = pd.read_csv(io.StringIO("""{{inputs.parameters.test-csv}}"""))
+          feature_cols = ["restart_count", "memory_pressure_pct", "image_pull_failures", "config_change_recency_hrs"]
+
+          preds = model.predict(test_df[feature_cols].values)
+          f1 = f1_score(test_df["crashloop_risk"].values, preds)
+
+          with open("/tmp/f1.txt", "w") as f:
+              f.write(f"{f1:.4f}")
+
+          print(f"F1 = {f1:.4f}")
+
+    # ------------------------------------------------------------------
+    # Step 4 (conditional): register + apply the promotion gate against a
+    # throwaway in-container sqlite MLflow store — see the file-level
+    # comment above for why this isn't a persistent shared registry here.
+    # ------------------------------------------------------------------
+    - name: register-and-promote
+      inputs:
+        parameters:
+          - name: model-b64
+          - name: f1
+      script:
+        image: python:3.12-slim
+        command: [python]
+        source: |
+          import subprocess, sys
+          subprocess.run(
+              [sys.executable, "-m", "pip", "install", "--quiet",
+               "mlflow-skinny==3.14.0", "sqlalchemy==2.0.51", "alembic==1.18.5",
+               "pandas==2.3.3", "skops==0.14.0", "scikit-learn", "numpy"],
+              check=True,
+          )
+          import base64, pickle
+          import mlflow
+          from mlflow.tracking import MlflowClient
+
+          model = pickle.loads(base64.b64decode("""{{inputs.parameters.model-b64}}"""))
+          f1 = float("{{inputs.parameters.f1}}")
+
+          mlflow.set_tracking_uri("sqlite:////tmp/mlflow.db")
+          client = MlflowClient()
+
+          with mlflow.start_run() as run:
+              mlflow.log_metric("f1_score", f1)
+              mlflow.sklearn.log_model(model, name="model", serialization_format="cloudpickle")
+              model_uri = f"runs:/{run.info.run_id}/model"
+
+          result = mlflow.register_model(model_uri, "pod-crashloop-classifier")
+          client.set_registered_model_alias("pod-crashloop-classifier", "production", result.version)
+          print(f"[PROMOTE] version {result.version}, F1={f1:.4f} (this run's blank registry — nothing to beat)")
